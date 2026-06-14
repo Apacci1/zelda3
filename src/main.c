@@ -1,3 +1,5 @@
+#include <windows.h>
+#include <commdlg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -276,18 +278,58 @@ static const struct RendererFuncs kSdlRendererFuncs  = {
 
 void OpenGLRenderer_Create(struct RendererFuncs *funcs, bool use_opengl_es);
 
+// Unique function to read zelda3.ini specifically for the Console flag
+static bool ZeldaCheckConsoleSetting(void) {
+    FILE* ini = fopen("zelda3.ini", "r");
+    if (!ini) return false; // Default to hiding the console if .ini is missing
+
+    char line[256];
+    bool enable_console = false;
+
+    while (fgets(line, sizeof(line), ini)) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        char* key = strstr(line, "Console");
+        if (key) {
+            char* value = strchr(line, '=');
+            if (value) {
+                value++;
+                if (strstr(value, "true") || strstr(value, "1")) {
+                    enable_console = true;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(ini);
+    return enable_console;
+}
+
 #undef main
 int main(int argc, char** argv) {
-  argc--, argv++;
-  const char *config_file = NULL;
-  if (argc >= 2 && strcmp(argv[0], "--config") == 0) {
-    config_file = argv[1];
-    argc -= 2, argv += 2;
-  } else {
-    SwitchDirectory();
-  }
-  ParseConfigFile(config_file);
-  LoadAssets();
+    argc--, argv++;
+    const char* config_file = NULL;
+    if (argc >= 2 && strcmp(argv[0], "--config") == 0) {
+        config_file = argv[1];
+        argc -= 2, argv += 2;
+    }
+    else {
+        SwitchDirectory(); // This fixes the path so the game can see zelda3.ini!
+    }
+
+    ParseConfigFile(config_file);
+
+    // MOVE THE HIDE CODE HERE (After SwitchDirectory has aligned the paths)
+#ifdef _WIN32
+    if (!ZeldaCheckConsoleSetting()) {
+        FreeConsole();
+    }
+#endif
+
+    LoadAssets();
   LoadLinkGraphics();
 
   ZeldaInitialize();
@@ -378,12 +420,6 @@ int main(int argc, char** argv) {
 
   if (argc >= 1 && !g_run_without_emu)
     LoadRom(argv[0]);
-
-#if defined(_WIN32)
-  _mkdir("saves");
-#else
-  mkdir("saves", 0755);
-#endif
 
   ZeldaReadSram();
 
@@ -809,46 +845,116 @@ const uint8 *g_asset_ptrs[kNumberOfAssets];
 uint32 g_asset_sizes[kNumberOfAssets];
 
 static void LoadAssets() {
-  size_t length = 0;
-  uint8 *data = ReadWholeFile("zelda3_assets.dat", &length);
-  if (!data) {
-    size_t bps_length, bps_src_length;
-    uint8 *bps, *bps_src;
-    bps = ReadWholeFile("zelda3_assets.bps", &bps_length);
-    if (!bps)
-      Die("Failed to read zelda3_assets.dat. Please see the README for information about how you get this file.");
-    bps_src = ReadWholeFile("zelda3.sfc", &bps_src_length);
-    if (!bps_src)
-      Die("Missing file: zelda3.sfc");
-    data = ApplyBps(bps_src, bps_src_length, bps, bps_length, &length);
-    if (!data)
-      Die("Unable to apply zelda3_assets.bps. Please make sure you got the right version of 'zelda3.sfc'");
-  }
+    size_t length = 0;
+    uint8* data = ReadWholeFile("zelda3_assets.dat", &length);
 
-  static const char kAssetsSig[] = { kAssets_Sig };
+    if (!data) {
+        size_t bps_length, bps_src_length;
+        uint8* bps, * bps_src;
 
-  if (length < 16 + 32 + 32 + 8 + kNumberOfAssets * 4 ||
-      memcmp(data, kAssetsSig, 48) != 0 ||
-      *(uint32*)(data + 80) != kNumberOfAssets)
-    Die("Invalid assets file");
+        bps = ReadWholeFile("zelda3_assets.bps", &bps_length);
+        if (!bps)
+            Die("Failed to read zelda3_assets.dat. Please see the README for information about how you get this file.");
 
-  uint32 offset = 88 + kNumberOfAssets * 4 + *(uint32 *)(data + 84);
+        char exePath[MAX_PATH];
+        char iniPath[MAX_PATH];
+        char romPath[MAX_PATH];
 
-  for (size_t i = 0; i < kNumberOfAssets; i++) {
-    uint32 size = *(uint32 *)(data + 88 + i * 4);
-    offset = (offset + 3) & ~3;
-    if ((uint64)offset + size > length)
-      Die("Assets file corruption");
-    g_asset_sizes[i] = size;
-    g_asset_ptrs[i] = data + offset;
-    offset += size;
-  }
+        // Build path to zelda3.ini next to zelda3.exe
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
 
-  if (g_config.features0 & kFeatures0_DimFlashes) { // patch dungeon floor palettes
-    kPalette_DungBgMain[0x484] = 0x70;
-    kPalette_DungBgMain[0x485] = 0x95;
-    kPalette_DungBgMain[0x486] = 0x57;
-  }
+        strcpy(iniPath, exePath);
+        char* slash = strrchr(iniPath, '\\');
+        if (slash)
+            strcpy(slash + 1, "zelda3.ini");
+
+        // Read stored ROM path
+        GetPrivateProfileStringA(
+            "Paths",
+            "RomPath",
+            "",
+            romPath,
+            MAX_PATH,
+            iniPath);
+
+        // If missing or file no longer exists, ask user
+        if (romPath[0] == '\0' ||
+            GetFileAttributesA(romPath) == INVALID_FILE_ATTRIBUTES) {
+
+            OPENFILENAMEA ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ZeroMemory(romPath, sizeof(romPath));
+
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = NULL;
+            ofn.lpstrFile = romPath;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrFilter =
+                "SNES ROM (*.sfc)\0*.sfc\0"
+                "All Files (*.*)\0*.*\0";
+            ofn.nFilterIndex = 1;
+            ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+            ofn.lpstrTitle = "Select your Zelda 3 ROM";
+
+            if (!GetOpenFileNameA(&ofn))
+                Die("No ROM selected.");
+
+            // Check if the [Paths] section already exists.
+            // If it doesn't, manually append a newline to the file first so there is a gap!
+            char testBuf[4];
+            GetPrivateProfileStringA("Paths", "RomPath", "", testBuf, sizeof(testBuf), iniPath);
+            if (testBuf[0] == '\0') {
+                FILE* iniFile = fopen(iniPath, "a");
+                if (iniFile) {
+                    fprintf(iniFile, "\n");
+                    fclose(iniFile);
+                }
+            }
+
+            // Save selected path
+            WritePrivateProfileStringA(
+                "Paths",
+                "RomPath",
+                romPath,
+                iniPath);
+        }
+
+        bps_src = ReadWholeFile(romPath, &bps_src_length);
+
+        if (!bps_src)
+            Die("Unable to read selected ROM file.");
+
+        data = ApplyBps(bps_src, bps_src_length, bps, bps_length, &length);
+
+        if (!data)
+            Die("Unable to apply zelda3_assets.bps. Please make sure you got the right version of the selected ROM.");
+    }
+
+    static const char kAssetsSig[] = { kAssets_Sig };
+
+    if (length < 16 + 32 + 32 + 8 + kNumberOfAssets * 4 ||
+        memcmp(data, kAssetsSig, 48) != 0 ||
+        *(uint32*)(data + 80) != kNumberOfAssets)
+        Die("Invalid assets file");
+
+    uint32 offset = 88 + kNumberOfAssets * 4 + *(uint32*)(data + 84);
+
+    for (size_t i = 0; i < kNumberOfAssets; i++) {
+        uint32 size = *(uint32*)(data + 88 + i * 4);
+        offset = (offset + 3) & ~3;
+        if ((uint64)offset + size > length)
+            Die("Assets file corruption");
+
+        g_asset_sizes[i] = size;
+        g_asset_ptrs[i] = data + offset;
+        offset += size;
+    }
+
+    if (g_config.features0 & kFeatures0_DimFlashes) {
+        kPalette_DungBgMain[0x484] = 0x70;
+        kPalette_DungBgMain[0x485] = 0x95;
+        kPalette_DungBgMain[0x486] = 0x57;
+    }
 }
 
 // Go some steps up and find zelda3.ini

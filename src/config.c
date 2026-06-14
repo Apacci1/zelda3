@@ -480,42 +480,61 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
   return false;
 }
 
-static bool ParseOneConfigFile(const char *filename, int depth) {
-  char *filedata = (char*)ReadWholeFile(filename, NULL), *p;
-  if (!filedata)
-    return false;
-  
-  int section = -2;
-  g_config.memory_buffer = filedata;
+static bool ParseOneConfigFile(const char* filename, int depth) {
+    char* filedata = (char*)ReadWholeFile(filename, NULL), * p;
+    if (!filedata)
+        return false;
 
-  for (int lineno = 1; (p = NextLineStripComments(&filedata)) != NULL; lineno++) {
-    if (*p == 0)
-      continue; // empty line
-    if (*p == '[') {
-      section = GetIniSection(p);
-      if (section < 0)
-        fprintf(stderr, "%s:%d: Invalid .ini section %s\n", filename, lineno, p);
-    } else if (*p == '!' && SkipPrefix(p + 1, "include ")) {
-      char *tt = p + 8;
-      char *new_filename = ReplaceFilenameWithNewPath(filename, NextPossiblyQuotedString(&tt));
-      if (depth > 10 || !ParseOneConfigFile(new_filename, depth + 1))
-        fprintf(stderr, "Warning: Unable to read %s\n", new_filename);
-      free(new_filename);
-    } else if (section == -2) {
-      fprintf(stderr, "%s:%d: Expecting [section]\n", filename, lineno);
-    } else {
-      char *v = SplitKeyValue(p);
-      if (v == NULL) {
-        fprintf(stderr, "%s:%d: Expecting 'key=value'\n", filename, lineno);
-        continue;
-      }
-      if (section >= 0 && !HandleIniConfig(section, p, v))
-        fprintf(stderr, "%s:%d: Can't parse '%s'\n", filename, lineno, p);
+    int section = -2;
+    g_config.memory_buffer = filedata;
+
+    for (int lineno = 1; (p = NextLineStripComments(&filedata)) != NULL; lineno++) {
+        if (*p == 0)
+            continue; // empty line
+        if (*p == '[') {
+            // Check if it's our custom [Paths] section
+            if (strcmp(p, "[Paths]") == 0) {
+                section = -3; // Give our custom section a distinct dummy ID
+            }
+            else {
+                section = GetIniSection(p);
+                if (section < 0)
+                    fprintf(stderr, "%s:%d: Invalid .ini section %s\n", filename, lineno, p);
+            }
+        }
+        else if (*p == '!' && SkipPrefix(p + 1, "include ")) {
+            char* tt = p + 8;
+            char* new_filename = ReplaceFilenameWithNewPath(filename, NextPossiblyQuotedString(&tt));
+            if (depth > 10 || !ParseOneConfigFile(new_filename, depth + 1))
+                fprintf(stderr, "Warning: Unable to read %s\n", new_filename);
+            free(new_filename);
+        }
+        else if (section == -2) {
+            fprintf(stderr, "%s:%d: Expecting [section]\n", filename, lineno);
+        }
+        else {
+            char* v = SplitKeyValue(p);
+            if (v == NULL) {
+                fprintf(stderr, "%s:%d: Expecting 'key=value'\n", filename, lineno);
+                continue;
+            }
+
+            // Silently skip our custom keys no matter what section they are in
+            if (strcmp(p, "Portable") == 0 || strcmp(p, "Console") == 0) {
+                continue;
+            }
+
+            // If we are in our custom [Paths] section, do nothing and don't throw an error
+            if (section == -3) {
+                continue;
+            }
+
+            if (section >= 0 && !HandleIniConfig(section, p, v))
+                fprintf(stderr, "%s:%d: Can't parse '%s'\n", filename, lineno, p);
+        }
     }
-  }
-  return true;
+    return true;
 }
-
 void ParseConfigFile(const char *filename) {
   g_config.msuvolume = 100;  // default msu volume, 100%
 
@@ -526,4 +545,32 @@ void ParseConfigFile(const char *filename) {
       fprintf(stderr, "Warning: Unable to read config file %s\n", filename);
   }
   RegisterDefaultKeys();
+}
+
+bool IsConsoleEnabled(void) {
+    FILE* ini = fopen("zelda3.ini", "r");
+    if (!ini) return false; // Default to hiding console if ini is missing
+
+    char line[256];
+    bool enable_console = false;
+
+    while (fgets(line, sizeof(line), ini)) {
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        char* key = strstr(line, "Console");
+        if (key) {
+            char* value = strchr(line, '=');
+            if (value) {
+                value++;
+                if (strstr(value, "true") || strstr(value, "1")) {
+                    enable_console = true;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(ini);
+    return enable_console;
 }

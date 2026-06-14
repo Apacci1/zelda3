@@ -791,27 +791,116 @@ static const char *const kReferenceSaves[] = {
   "Chapter 13 - After Ganon's Tower.sav",
 };
 
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+void EnsureDirectoryExists(const char* path) {
+#ifdef _WIN32
+    // Windows only takes the path string
+    _mkdir(path);
+#else
+    // Linux/macOS requires the path and the mode permissions
+    mkdir(path, 0777);
+#endif
+}
+
+// Helper to check if portable mode is enabled in zelda3.ini
+bool IsPortableMode(void) {
+    FILE* ini = fopen("zelda3.ini", "r");
+    if (!ini) return false; // Default to AppData if ini is missing
+
+    char line[256];
+    bool portable = false;
+
+    while (fgets(line, sizeof(line), ini)) {
+        // Skip comment lines or empty lines
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+
+        // Look specifically for the "portable" key
+        char* key = strstr(line, "Portable");
+        if (key) {
+            // Find the value after the assignment
+            char* value = strchr(line, '=');
+            if (value) {
+                value++; // Move past the '=' sign
+
+                // Check if the value contains 'true' or '1'
+                if (strstr(value, "true") || strstr(value, "1")) {
+                    portable = true;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(ini);
+    return portable;
+}
+
+// Helper to construct the base directory path for saves
+void GetSaveDirectory(char* out_path, size_t max_len) {
+    if (IsPortableMode()) {
+        // Portable mode: "saves/" in the game folder
+        snprintf(out_path, max_len, "saves");
+        EnsureDirectoryExists(out_path);
+    }
+    else {
+        // Standard mode: %LOCALAPPDATA%\LinkToThePast
+        const char* localappdata = getenv("LOCALAPPDATA");
+        if (localappdata) {
+            snprintf(out_path, max_len, "%s\\LinkToThePast", localappdata);
+            EnsureDirectoryExists(out_path);
+        }
+        else {
+            // Fallback to local saves folder if %LOCALAPPDATA% isn't found for some reason
+            snprintf(out_path, max_len, "saves");
+            EnsureDirectoryExists(out_path);
+        }
+    }
+}
+
 void SaveLoadSlot(int cmd, int which) {
-  char name[128];
-  if (which & 256) {
-    if (cmd == kSaveLoad_Save)
-      return;
-    sprintf(name, "saves/ref/%s", kReferenceSaves[which - 256]);
-  } else {
-    sprintf(name, "saves/save%d.sav", which);
-  }
-  FILE *f = fopen(name, cmd != kSaveLoad_Save ? "rb" : "wb");
-  if (f) {
-    printf("*** %s slot %d\n",
-      cmd == kSaveLoad_Save ? "Saving" : cmd == kSaveLoad_Load ? "Loading" : "Replaying", which);
+    char base_dir[256];
+    char name[512];
 
-    if (cmd != kSaveLoad_Save)
-      StateRecorder_Load(&state_recorder, f, cmd == kSaveLoad_Replay);
-    else
-      StateRecorder_Save(&state_recorder, f);
+    // Get the correct base directory based on config
+    GetSaveDirectory(base_dir, sizeof(base_dir));
 
-    fclose(f);
-  }
+    if (which & 256) {
+        if (cmd == kSaveLoad_Save)
+            return;
+
+        // Create the reference directory inside the base directory if saving/loading ref
+        char ref_dir[512];
+        snprintf(ref_dir, sizeof(ref_dir), "%s/ref", base_dir);
+        EnsureDirectoryExists(ref_dir);
+
+        snprintf(name, sizeof(name), "%s/ref/%s", base_dir, kReferenceSaves[which - 256]);
+    }
+    else {
+        snprintf(name, sizeof(name), "%s/save%d.sav", base_dir, which);
+    }
+
+    FILE* f = fopen(name, cmd != kSaveLoad_Save ? "rb" : "wb");
+    if (f) {
+        printf("*** %s slot %d\n",
+            cmd == kSaveLoad_Save ? "Saving" : cmd == kSaveLoad_Load ? "Loading" : "Replaying", which);
+
+        if (cmd != kSaveLoad_Save)
+            StateRecorder_Load(&state_recorder, f, cmd == kSaveLoad_Replay);
+        else
+            StateRecorder_Save(&state_recorder, f);
+
+        fclose(f);
+    }
+    else {
+        printf("--- Failed to open save file: %s\n", name);
+    }
 }
 
 typedef struct StateRecoderMultiPatch {
@@ -869,22 +958,41 @@ void PatchCommand(char c) {
 
 
 void ZeldaReadSram() {
-  FILE *f = fopen("saves/sram.dat", "rb");
-  if (f) {
-    if (fread(g_zenv.sram, 1, 8192, f) != 8192)
-      fprintf(stderr, "Error reading saves/sram.dat\n");
-    fclose(f);
-    EmuSynchronizeWholeState();
-  }
+    char base_dir[256];
+    char path_dat[512];
+
+    // Get the correct base directory based on config
+    GetSaveDirectory(base_dir, sizeof(base_dir));
+    snprintf(path_dat, sizeof(path_dat), "%s/sram.dat", base_dir);
+
+    FILE* f = fopen(path_dat, "rb");
+    if (f) {
+        if (fread(g_zenv.sram, 1, 8192, f) != 8192)
+            fprintf(stderr, "Error reading %s\n", path_dat);
+        fclose(f);
+        EmuSynchronizeWholeState();
+    }
 }
 
 void ZeldaWriteSram() {
-  rename("saves/sram.dat", "saves/sram.bak");
-  FILE *f = fopen("saves/sram.dat", "wb");
-  if (f) {
-    fwrite(g_zenv.sram, 1, 8192, f);
-    fclose(f);
-  } else {
-    fprintf(stderr, "Unable to write saves/sram.dat\n");
-  }
+    char base_dir[256];
+    char path_dat[512];
+    char path_bak[512];
+
+    // Get the correct base directory based on config
+    GetSaveDirectory(base_dir, sizeof(base_dir));
+    snprintf(path_dat, sizeof(path_dat), "%s/sram.dat", base_dir);
+    snprintf(path_bak, sizeof(path_bak), "%s/sram.bak", base_dir);
+
+    // Attempt to backup the old sram file if it exists
+    rename(path_dat, path_bak);
+
+    FILE* f = fopen(path_dat, "wb");
+    if (f) {
+        fwrite(g_zenv.sram, 1, 8192, f);
+        fclose(f);
+    }
+    else {
+        fprintf(stderr, "Unable to write %s\n", path_dat);
+    }
 }
